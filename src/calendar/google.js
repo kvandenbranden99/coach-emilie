@@ -38,10 +38,10 @@ async function getGoogleCalendarEvents(startTime, endTime) {
     });
 
     return (response.data.items || [])
-      .filter(e => e.status !== 'cancelled')
+      .filter(e => e.status !== 'cancelled' && e.start.dateTime)
       .map(e => ({
-        start: DateTime.fromISO(e.start.dateTime || e.start.date, { zone: tz }),
-        end:   DateTime.fromISO(e.end.dateTime   || e.end.date,   { zone: tz }),
+        start: DateTime.fromISO(e.start.dateTime, { zone: tz }),
+        end:   DateTime.fromISO(e.end.dateTime,   { zone: tz }),
         summary: e.summary || 'Bezet'
       }));
   } catch (error) {
