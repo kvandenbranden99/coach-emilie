@@ -52,20 +52,25 @@ async function handleIncomingMessage(text, channel) {
     return await _handleFridayMessage(text, state);
   }
 
-  // 2. In-progress habit-addition conversation
+  // 2. Active user-initiated chat — continue with history, don't restart
+  if (state.type === 'user_chat') {
+    return await _handleUserChatMessage(text, state, channel);
+  }
+
+  // 3. In-progress habit-addition conversation
   if (getHabitConversationState()) {
     const reply = await processAddHabitStep(text);
     if (reply) await _sendMessage(reply, channel);
     return;
   }
 
-  // 3. Habit management intent
+  // 4. Habit management intent
   const intent = await detectHabitManagementIntent(text);
   if (intent) {
     return await _handleHabitIntent(intent, text, channel);
   }
 
-  // 4. Response to a pending habit reminder
+  // 5. Response to a pending habit reminder
   const pending = getPendingReminders();
   const habitIds = Object.keys(pending);
   if (habitIds.length > 0) {
@@ -82,8 +87,53 @@ async function handleIncomingMessage(text, channel) {
     }
   }
 
-  // 5. Generic conversation
-  const reply = await generateGenericResponse(text);
+  // 6. No active session — start a new user chat and track history
+  return await _startUserChat(text, channel);
+}
+
+// ---------------------------------------------------------------------------
+// User-initiated chat handlers
+// ---------------------------------------------------------------------------
+
+const STOP_WORDS = ['klaar', 'stop', 'afsluiten', 'einde', 'bye', 'doei', 'tot later', 'done'];
+const MAX_HISTORY = 20; // max berichten bewaard in geheugen
+
+async function _startUserChat(text, channel) {
+  const reply = await generateGenericResponse(text, []);
+
+  setConversationState({
+    type: 'user_chat',
+    history: [
+      { role: 'user',      content: text  },
+      { role: 'assistant', content: reply }
+    ]
+  });
+
+  await _sendMessage(reply, channel);
+  logger.info('Nieuw gebruikersgesprek gestart');
+}
+
+async function _handleUserChatMessage(text, state, channel) {
+  const wantsToStop = STOP_WORDS.some(w => text.toLowerCase().includes(w));
+
+  if (wantsToStop) {
+    clearConversationState();
+    await _sendMessage('Tot later! 👋 Laat het me weten als je me nodig hebt.', channel);
+    logger.info('Gebruikersgesprek afgesloten op verzoek');
+    return;
+  }
+
+  const history = state.history || [];
+  const reply   = await generateGenericResponse(text, history);
+
+  // Append new exchange and cap history to avoid unbounded growth
+  const updatedHistory = [
+    ...history,
+    { role: 'user',      content: text  },
+    { role: 'assistant', content: reply }
+  ].slice(-MAX_HISTORY);
+
+  setConversationState({ ...state, history: updatedHistory });
   await _sendMessage(reply, channel);
 }
 
