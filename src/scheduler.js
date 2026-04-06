@@ -160,7 +160,7 @@ async function _sendReminderIfFree(habit, period, now, dateStr, bounds, attemptN
   const text = await generateHabitReminder(habit, period, attemptNumber);
 
   // Channel: Friday session always Telegram, others by time
-  const channel = determineChannel();
+  const channel = await determineChannel();
   await _sendMessage(text, channel);
 
   // Persist

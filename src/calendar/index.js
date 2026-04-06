@@ -1,5 +1,5 @@
 const { DateTime } = require('luxon');
-const { getGoogleCalendarEvents }  = require('./google');
+const { getGoogleCalendarEvents, hasGoogleAllDayEvent }  = require('./google');
 const { getOutlookCalendarEvents } = require('./outlook');
 const logger = require('../utils/logger');
 
@@ -117,4 +117,18 @@ async function findNextFreeSlot(afterTime, endTime, minMinutes = MIN_FREE_SLOT_M
   }
 }
 
-module.exports = { getCombinedBusySlots, findFreeSlots, isCurrentlyFree, findNextFreeSlot };
+/**
+ * Returns true if today (on a weekday) has at least one all-day event in Google Calendar.
+ * @returns {Promise<boolean>}
+ */
+async function hasAllDayEventToday() {
+  const today = DateTime.now().setZone(TIMEZONE);
+  if (today.weekday >= 6) return false; // weekend: not relevant
+  try {
+    return await hasGoogleAllDayEvent(today);
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { getCombinedBusySlots, findFreeSlots, isCurrentlyFree, findNextFreeSlot, hasAllDayEventToday };

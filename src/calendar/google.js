@@ -50,4 +50,35 @@ async function getGoogleCalendarEvents(startTime, endTime) {
   }
 }
 
-module.exports = { getGoogleCalendarEvents };
+/**
+ * Returns true if there is at least one all-day event on the given date.
+ * @param {DateTime} date
+ * @returns {Promise<boolean>}
+ */
+async function hasGoogleAllDayEvent(date) {
+  if (!process.env.GOOGLE_REFRESH_TOKEN || !process.env.GOOGLE_CLIENT_ID) return false;
+
+  try {
+    const auth     = getOAuth2Client();
+    const calendar = google.calendar({ version: 'v3', auth });
+
+    const dayStart = date.startOf('day');
+    const dayEnd   = dayStart.plus({ days: 1 });
+
+    const response = await calendar.events.list({
+      calendarId:   process.env.GOOGLE_CALENDAR_ID || 'primary',
+      timeMin:      dayStart.toISO(),
+      timeMax:      dayEnd.toISO(),
+      singleEvents: true,
+    });
+
+    return (response.data.items || []).some(
+      e => e.status !== 'cancelled' && e.start.date && !e.start.dateTime
+    );
+  } catch (error) {
+    logger.error('Fout bij ophalen heel-dag events:', error.message);
+    return false;
+  }
+}
+
+module.exports = { getGoogleCalendarEvents, hasGoogleAllDayEvent };
