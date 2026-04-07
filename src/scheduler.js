@@ -57,9 +57,10 @@ async function checkAndSendHabitReminders() {
   const now     = DateTime.now().setZone(TIMEZONE);
   const dateStr = now.toFormat('yyyy-MM-dd');
 
-  // Skip reminder checks during Friday session
-  if (getConversationState().type === 'friday_session') {
-    logger.debug('Vrijdagsessie actief — herinneringen overgeslagen');
+  // Skip reminder checks during Friday session or active user chat
+  const convType = getConversationState().type;
+  if (convType === 'friday_session' || convType === 'user_chat') {
+    logger.debug(`Gesprek actief (${convType}) — herinneringen overgeslagen`);
     return;
   }
 
