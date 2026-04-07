@@ -69,15 +69,18 @@ async function generateHabitReminder(habit, period, attemptNumber) {
 
 /**
  * Classify a user message as 'completed', 'declined', or 'unknown'.
+ * Pass habitName to evaluate whether that specific habit was completed.
  */
-async function detectResponse(userMessage) {
+async function detectResponse(userMessage, habitName = null) {
+  const subject = habitName ? `"${habitName}"` : 'de gevraagde taak';
   const response = await client.messages.create({
     model:      MODEL,
     max_tokens: 10,
-    system:     `Analyseer of het bericht aangeeft dat de gebruiker iets gedaan heeft (positief) of niet kan/wil doen (negatief).
+    system:     `Analyseer of het bericht aangeeft dat de gebruiker ${subject} gedaan heeft (positief) of niet kan/wil doen (negatief).
+Als het bericht meerdere gewoonten bespreekt, beoordeel dan uitsluitend of ${subject} als gedaan wordt gemeld.
 Antwoord enkel met één woord: "completed", "declined", of "unknown".
-Voorbeelden positief: gedaan, klaar, ✓, 👍, ja, gelukt, oké.
-Voorbeelden negatief: nee, geen tijd, kan niet, later, ❌, overgeslagen.`,
+Voorbeelden positief: gedaan, klaar, ✓, 👍, ja, gelukt, oké, al gehaald.
+Voorbeelden negatief: nee, geen tijd, kan niet, later, straks, nog niet, ❌, overgeslagen.`,
     messages:   [{ role: 'user', content: userMessage }]
   });
 

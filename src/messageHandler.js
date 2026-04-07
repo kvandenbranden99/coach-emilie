@@ -57,14 +57,29 @@ async function handleIncomingMessage(text, channel) {
   const pending = getPendingReminders();
   const habitIds = Object.keys(pending);
   if (habitIds.length > 0) {
-    const response = await detectResponse(text);
-    if (response !== 'unknown') {
-      for (const habitId of habitIds) {
+    const db = getDb();
+    let completedCount = 0;
+    let declinedCount  = 0;
+
+    for (const habitId of habitIds) {
+      const habit    = db.prepare('SELECT name FROM habits WHERE id = ?').get(habitId);
+      const response = await detectResponse(text, habit ? habit.name : null);
+      if (response !== 'unknown') {
         await _recordReminderResponse(pending[habitId], response);
+        if (response === 'completed') completedCount++;
+        else declinedCount++;
       }
-      const reply = response === 'completed'
-        ? 'Super gedaan! 💪 Ik heb het geregistreerd.'
-        : 'Geen probleem, ik probeer het later opnieuw. 👍';
+    }
+
+    if (completedCount > 0 || declinedCount > 0) {
+      let reply;
+      if (completedCount > 0 && declinedCount === 0) {
+        reply = 'Super gedaan! 💪 Ik heb het geregistreerd.';
+      } else if (declinedCount > 0 && completedCount === 0) {
+        reply = 'Geen probleem, ik probeer het later opnieuw. 👍';
+      } else {
+        reply = 'Super gedaan met wat je al hebt gedaan! 💪 Voor de rest probeer ik het later opnieuw. 👍';
+      }
       await _sendMessage(reply, channel);
       return;
     }
