@@ -52,32 +52,15 @@ async function handleIncomingMessage(text, channel) {
     return await _handleFridayMessage(text, state);
   }
 
-  // 2. Active user-initiated chat — continue with history, don't restart
-  if (state.type === 'user_chat') {
-    return await _handleUserChatMessage(text, state, channel);
-  }
-
-  // 3. In-progress habit-addition conversation
-  if (getHabitConversationState()) {
-    const reply = await processAddHabitStep(text);
-    if (reply) await _sendMessage(reply, channel);
-    return;
-  }
-
-  // 4. Habit management intent
-  const intent = await detectHabitManagementIntent(text);
-  if (intent) {
-    return await _handleHabitIntent(intent, text, channel);
-  }
-
-  // 5. Response to a pending habit reminder
+  // 2. Response to a pending habit reminder — checked BEFORE user_chat so that
+  //    a reply to a reminder is never swallowed by an ongoing conversation.
   const pending = getPendingReminders();
   const habitIds = Object.keys(pending);
   if (habitIds.length > 0) {
     const response = await detectResponse(text);
     if (response !== 'unknown') {
       for (const habitId of habitIds) {
-        await _recordReminderResponse(parseInt(habitId, 10), response);
+        await _recordReminderResponse(pending[habitId], response);
       }
       const reply = response === 'completed'
         ? 'Super gedaan! 💪 Ik heb het geregistreerd.'
@@ -85,6 +68,24 @@ async function handleIncomingMessage(text, channel) {
       await _sendMessage(reply, channel);
       return;
     }
+  }
+
+  // 3. Active user-initiated chat — continue with history, don't restart
+  if (state.type === 'user_chat') {
+    return await _handleUserChatMessage(text, state, channel);
+  }
+
+  // 4. In-progress habit-addition conversation
+  if (getHabitConversationState()) {
+    const reply = await processAddHabitStep(text);
+    if (reply) await _sendMessage(reply, channel);
+    return;
+  }
+
+  // 5. Habit management intent
+  const intent = await detectHabitManagementIntent(text);
+  if (intent) {
+    return await _handleHabitIntent(intent, text, channel);
   }
 
   // 6. No active session — start a new user chat and track history
@@ -212,25 +213,16 @@ async function _handleHabitIntent(intent, message, channel) {
 // Record reminder response in DB
 // ---------------------------------------------------------------------------
 
-async function _recordReminderResponse(habitId, response) {
-  const db      = getDb();
-  const now     = DateTime.now().setZone(TIMEZONE);
-  const dateStr = now.toFormat('yyyy-MM-dd');
+async function _recordReminderResponse(pendingReminder, response) {
+  const db        = getDb();
+  const habitId   = pendingReminder.habitId;
+  const completed = response === 'completed' ? 1 : 0;
 
-  const reminder = db.prepare(`
-    SELECT * FROM reminders
-    WHERE habit_id = ? AND date = ? AND response IS NULL
-    ORDER BY sent_at DESC
-    LIMIT 1
-  `).get(habitId, dateStr);
+  // Update the exact reminder we sent, identified by its primary key
+  db.prepare('UPDATE reminders SET response = ?, completed = ? WHERE id = ?')
+    .run(response, completed, pendingReminder.reminderId);
 
-  if (reminder) {
-    const completed = response === 'completed' ? 1 : 0;
-    db.prepare('UPDATE reminders SET response = ?, completed = ? WHERE id = ?')
-      .run(response, completed, reminder.id);
-    logger.info(`Herinnering #${reminder.id} bijgewerkt → ${response}`);
-  }
-
+  logger.info(`Herinnering #${pendingReminder.reminderId} bijgewerkt → ${response}`);
   clearPendingReminder(habitId);
 }
 
