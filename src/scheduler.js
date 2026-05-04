@@ -8,7 +8,9 @@ const { isCurrentlyFree } = require('./calendar');
 const {
   setPendingReminder,
   setConversationState,
-  getConversationState
+  clearConversationState,
+  getConversationState,
+  isConversationStale
 } = require('./state');
 const { periodDefinitions } = require('./config/habits');
 const logger = require('./utils/logger');
@@ -56,6 +58,12 @@ function initScheduler() {
 async function checkAndSendHabitReminders() {
   const now     = DateTime.now().setZone(TIMEZONE);
   const dateStr = now.toFormat('yyyy-MM-dd');
+
+  // Auto-close stale user_chat so reminders aren't suppressed indefinitely.
+  if (isConversationStale()) {
+    logger.info('user_chat verlopen door inactiviteit — automatisch afgesloten door scheduler');
+    clearConversationState();
+  }
 
   // Skip reminder checks during Friday session or active user chat
   const convType = getConversationState().type;
@@ -255,6 +263,12 @@ async function midnightCleanup() {
     UPDATE reminders SET response = 'no_response'
     WHERE date = ? AND response IS NULL
   `).run(dateStr);
+
+  // Also clear any lingering user_chat at midnight (safety net)
+  if (getConversationState().type === 'user_chat') {
+    clearConversationState();
+    logger.info('user_chat opgeruimd bij nachtelijke cleanup');
+  }
 
   logger.info(`Nachtopruiming voltooid voor ${dateStr}`);
 }

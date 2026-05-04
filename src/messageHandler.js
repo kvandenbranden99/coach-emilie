@@ -2,6 +2,7 @@ const {
   getConversationState,
   setConversationState,
   clearConversationState,
+  isConversationStale,
   getPendingReminders,
   clearPendingReminder,
   getHabitConversationState
@@ -44,6 +45,13 @@ function setMessageSender(fn) {
 // ---------------------------------------------------------------------------
 
 async function handleIncomingMessage(text, channel) {
+  // Auto-close any user_chat that has been idle too long, so the user doesn't
+  // get stuck in chat mode (which suppresses scheduled reminders).
+  if (isConversationStale()) {
+    logger.info('user_chat verlopen door inactiviteit — automatisch afgesloten');
+    clearConversationState();
+  }
+
   const state = getConversationState();
   logger.info(`Inkomend bericht [${channel}]: "${text}" | staat: ${state.type}`);
 
