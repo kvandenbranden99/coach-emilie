@@ -262,11 +262,6 @@ async function startFridaySession() {
  * by inspecting which fields are already filled in the DB.
  */
 function _inferNextStepForOpenSession(session) {
-  // Map filled fields to the next logical question.
-  // The session table only persists went_well, was_difficult and grateful_for,
-  // so for the in-between steps we can only tell "we are past went_well",
-  // "we are past was_difficult", etc. We always restart on the *next* unanswered
-  // question.
   if (!session.went_well)     return 'went_well';
   if (!session.was_difficult) return 'was_difficult';
   if (!session.grateful_for)  return 'gratitude';
@@ -285,9 +280,21 @@ function _loadSessionHistory(sessionId, limit = 30) {
     WHERE session_type = 'friday_session' AND session_id = ?
     ORDER BY id ASC
   `).all(sessionId);
-
-  // Keep only the last `limit` turns
   return rows.slice(-limit).map(r => ({ role: r.role, content: r.content }));
+}
+
+/**
+ * Send a short acknowledgment on the originating channel when it differs
+ * from Telegram, so the user knows the session moved over.
+ */
+async function _ackOnOriginatingChannel(channel, text) {
+  if (!channel) return;
+  if (channel !== 'slack') return; // Telegram is the session channel — no ack needed there
+  try {
+    await _sendMessage(text, 'slack');
+  } catch (err) {
+    logger.warn(`Kon Slack-bevestiging niet sturen: ${err.message}`);
+  }
 }
 
 /**
@@ -315,6 +322,8 @@ async function triggerFridaySessionFromUser(channel = 'telegram') {
 }
 
 async function _resumeFridaySession(session, channel) {
+  logger.info(`Vrijdagsessie ${session.id} hervat op vraag van gebruiker (vanuit ${channel})`);
+
   const nextStep = _inferNextStepForOpenSession(session);
   const history  = _loadSessionHistory(session.id);
 
@@ -325,17 +334,15 @@ async function _resumeFridaySession(session, channel) {
     history
   });
 
-  // Friday session always goes via Telegram, but we acknowledge
-  // on the channel the user used so they know it has been picked up.
-  if (channel !== 'telegram') {
-    await _sendMessage('Ik pak de vrijdagsessie op in Telegram. 📲', channel);
-  }
+  // Acknowledge on Slack if that's where the user triggered from
+  await _ackOnOriginatingChannel(channel, 'Ik pak de vrijdagsessie op in Telegram. 📲');
+
+  // The session itself runs in Telegram
   await _sendMessage(
     'We pakken onze wekelijkse check-in weer op waar we gestopt zijn. 😊',
     'telegram'
   );
 
-  // Re-ask the appropriate question for the step we land on
   const followUp = {
     went_well:     'Wat is er goed gegaan deze week? 🌟',
     was_difficult: 'Wat was er moeilijk deze week?',
@@ -344,14 +351,14 @@ async function _resumeFridaySession(session, channel) {
   };
   await _sendMessage(followUp[nextStep] || followUp.went_well, 'telegram');
 
-  logger.info(`Vrijdagsessie ${session.id} hervat op stap "${nextStep}"`);
+  logger.info(`Vrijdagsessie ${session.id} klaar op stap "${nextStep}"`);
 }
 
 async function _startFridaySessionForUser(channel) {
   const now = DateTime.now().setZone(TIMEZONE);
   const db  = getDb();
 
-  logger.info('Vrijdagsessie gestart op vraag van gebruiker');
+  logger.info(`Vrijdagsessie gestart op vraag van gebruiker (vanuit ${channel})`);
 
   const { lastInsertRowid: sessionId } = db.prepare(`
     INSERT INTO friday_sessions (week_number, year) VALUES (?, ?)
@@ -364,9 +371,10 @@ async function _startFridaySessionForUser(channel) {
     history:   []
   });
 
-  if (channel !== 'telegram') {
-    await _sendMessage('Ik start onze wekelijkse check-in op in Telegram. 📲', channel);
-  }
+  // Acknowledge on Slack if that's where the user triggered from
+  await _ackOnOriginatingChannel(channel, 'Ik start onze wekelijkse check-in op in Telegram. 📲');
+
+  // The session itself runs in Telegram
   await _sendMessage('Tijd voor onze wekelijkse check-in. 😊', 'telegram');
 
   // Brief pause, then send the week report + first question
