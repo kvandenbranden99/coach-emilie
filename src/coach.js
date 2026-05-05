@@ -9,6 +9,28 @@ const MODEL   = 'claude-sonnet-4-6';
 const TIMEZONE = process.env.TIMEZONE || 'Europe/Brussels';
 
 // ---------------------------------------------------------------------------
+// Word-boundary helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if the message contains any of the keywords as a whole word
+ * (case-insensitive). Avoids false positives like "einde" matching
+ * "eindelijk" or "klaar" matching "klaarwakker".
+ */
+function _matchesAnyWord(message, keywords) {
+  if (!message) return false;
+  return keywords.some(kw => {
+    // Multi-word keyword: do a simple includes (only against word breaks
+    // is hard cross-language, and these are common phrases that only appear
+    // intentionally).
+    if (/\s/.test(kw)) {
+      return message.toLowerCase().includes(kw.toLowerCase());
+    }
+    return new RegExp(`\\b${kw}\\b`, 'i').test(message);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // System prompt helpers
 // ---------------------------------------------------------------------------
 
@@ -146,37 +168,31 @@ Antwoord enkel met één woord: "ja" of "nee".`,
 // Friday session — state machine
 // ---------------------------------------------------------------------------
 
-// Steps in order. Some steps stay active across multiple turns until the user
-// indicates they're done (todo_review, new_todos). Others advance after a
-// single user turn (went_well, was_difficult, gratitude, closing).
 const FRIDAY_STEPS = [
   'opening',
   'went_well',
   'was_difficult',
-  'todo_review',   // multi-turn: discuss last week's open todos
-  'new_todos',     // multi-turn: collect this week's new todos
+  'todo_review',
+  'new_todos',
   'gratitude',
   'closing'
 ];
 
-// Steps that may stay active across multiple user turns
 const MULTI_TURN_STEPS = new Set(['todo_review', 'new_todos']);
 
 /**
  * Detect whether the user signals they are done with the current multi-turn step.
- * Used to decide whether to advance to the next step or stay.
  */
 async function _detectStepDone(userMessage, stepContext) {
   if (!userMessage) return false;
-  const lower = userMessage.toLowerCase();
 
-  // Cheap keyword check first
+  // Cheap whole-word match first
   const doneKeywords = [
-    'klaar', 'genoeg', 'dat is alles', 'dat was het', 'meer niet',
-    'volgende', 'ga door', 'ga maar door', 'next', 'volgende vraag',
-    'verder', 'door', 'oké volgende', 'ok volgende'
+    'klaar', 'genoeg', 'volgende', 'verder', 'door', 'next',
+    'dat is alles', 'dat was het', 'meer niet', 'ga door', 'ga maar door',
+    'volgende vraag', 'oké volgende', 'ok volgende'
   ];
-  if (doneKeywords.some(kw => lower.includes(kw))) return true;
+  if (_matchesAnyWord(userMessage, doneKeywords)) return true;
 
   // AI fallback for ambiguous phrasings
   try {
@@ -209,12 +225,7 @@ Antwoord enkel met "ja" of "nee".`,
 }
 
 /**
- * From the conversation history of a session, extract concrete todos
- * formulated by the user as JSON. Returns an array of objects:
- *   [{ description, frequency, timesPerWeek }]
- *
- * frequency: 'once' | 'weekly' | 'daily'
- * timesPerWeek: integer (1-7) or null
+ * Extract concrete todos from session conversation history.
  */
 async function _extractTodosFromHistory(history) {
   if (!history || history.length === 0) return [];
@@ -258,10 +269,6 @@ Zonder markdown, zonder commentaar, alleen de JSON. Als er geen to-do's zijn:
   }
 }
 
-/**
- * Persist extracted todos for the given session's week.
- * Returns the number of todos inserted.
- */
 function _persistTodos(session, todos) {
   if (!todos || todos.length === 0) return 0;
   const db = getDb();
@@ -284,13 +291,8 @@ function _persistTodos(session, todos) {
   return todos.length;
 }
 
-/**
- * Get the open todos from the most recent previous week's session(s),
- * to be reviewed this week.
- */
 function _getOpenTodosFromPreviousWeeks(currentSession) {
   const db = getDb();
-  // Anything from earlier weeks that isn't completed
   return db.prepare(`
     SELECT id, description, frequency, times_per_week, week_number, year
     FROM todos
@@ -302,13 +304,9 @@ function _getOpenTodosFromPreviousWeeks(currentSession) {
 
 function formatOpenTodosList(todos) {
   if (!todos || todos.length === 0) return null;
-  return todos
-    .map((t, i) => `${i + 1}. ${t.description}`)
-    .join('\n');
+  return todos.map((t, i) => `${i + 1}. ${t.description}`).join('\n');
 }
 
-// Per-step instructions for Claude. The "ask" entries are the literal first
-// question to send when entering that step (used for resume + initial entry).
 const STEP_PROMPTS = {
   opening:       'Start de sessie met een warme begroeting en kondig aan dat je het weekoverzicht al hebt gestuurd. Vraag wat er goed is gegaan deze week.',
   went_well:     'De gebruiker heeft geantwoord op "wat ging goed". Reageer kort en positief. Stel daarna de volgende vraag: "Wat was er moeilijk deze week?"',
@@ -325,34 +323,25 @@ Vraag dan: "Heb je nog meer to-do's of zijn dit ze?"`,
   closing:       'De gebruiker heeft de dankbaarheidsvraag beantwoord. Sluit de sessie warm af en laat hen weten dat je zo de samenvatting stuurt.'
 };
 
-/**
- * Process a single user turn in the Friday session.
- *
- * Returns { responseText, nextStep, isComplete, sideEffects }
- *   sideEffects: optional array of strings to log
- */
 async function processFridaySession(userMessage, sessionState) {
   const db = getDb();
   const { sessionId, step, history } = sessionState;
 
-  // Detect explicit close request — always wins
+  // Detect explicit close request — uses whole-word matching so 'einde'
+  // doesn't match inside 'eindelijk', etc.
   const closeWords = ['einde', 'afsluiten', 'finish', 'beëindig'];
-  const wantsToClose = userMessage
-    && closeWords.some(w => userMessage.toLowerCase().includes(w));
+  const wantsToClose = _matchesAnyWord(userMessage, closeWords);
 
-  // Decide what step to drive this turn from
   let currentStep = wantsToClose ? 'closing' : step;
   let nextStep    = currentStep;
   let stayOnStep  = false;
   const sideEffects = [];
 
-  // For multi-turn steps, ask: is the user done?
   if (!wantsToClose && MULTI_TURN_STEPS.has(currentStep)) {
     const done = await _detectStepDone(userMessage, STEP_PROMPTS[currentStep]);
     stayOnStep = !done;
   }
 
-  // When LEAVING the new_todos step, extract and persist todos
   if (currentStep === 'new_todos' && !stayOnStep) {
     try {
       const fullHistory = [
@@ -372,7 +361,6 @@ async function processFridaySession(userMessage, sessionState) {
 
   const stepPrompt = STEP_PROMPTS[currentStep] || STEP_PROMPTS.closing;
 
-  // Build conversation history for Claude
   const messages = [
     ...(history || []).map(h => ({ role: h.role, content: h.content }))
   ];
@@ -380,7 +368,6 @@ async function processFridaySession(userMessage, sessionState) {
     messages.push({ role: 'user', content: userMessage });
   }
 
-  // Add open todos info to system prompt during todo_review step
   let extraContext = '';
   if (currentStep === 'todo_review') {
     const session  = db.prepare('SELECT * FROM friday_sessions WHERE id = ?').get(sessionId);
@@ -413,7 +400,6 @@ Reageer passend op het bericht van de gebruiker en leid het gesprek verder.`;
 
   const responseText = response.content[0].text;
 
-  // Persist user message + step-specific data
   if (userMessage) {
     db.prepare(`
       INSERT INTO conversation_history (session_type, session_id, role, content)
@@ -434,7 +420,6 @@ Reageer passend op het bericht van de gebruiker en leid het gesprek verder.`;
     VALUES ('friday_session', ?, 'assistant', ?)
   `).run(sessionId, responseText);
 
-  // Determine next step
   const isComplete = currentStep === 'closing';
   if (!isComplete) {
     if (stayOnStep) {
@@ -458,7 +443,7 @@ async function generateWeekReport(weekNumber, year) {
   const db     = getDb();
   const habits = db.prepare('SELECT * FROM habits WHERE active = 1').all();
   const now    = DateTime.now().setZone(TIMEZONE);
-  const weekStart = now.startOf('week'); // Monday
+  const weekStart = now.startOf('week');
 
   const dayNames = ['Maandag', 'Dinsdag', 'Woensdag', 'Donderdag', 'Vrijdag'];
 
@@ -514,7 +499,6 @@ async function generateWeekReport(weekNumber, year) {
     report += `Weekscore: ${totalCompleted}/${totalExpected} — ${score}% ${scoreEmoji}\n\n`;
   }
 
-  // Append open todos from previous weeks if any
   const openTodos = db.prepare(`
     SELECT description FROM todos
     WHERE completed = 0
@@ -532,10 +516,6 @@ async function generateWeekReport(weekNumber, year) {
 
   return report;
 }
-
-// ---------------------------------------------------------------------------
-// Session summary
-// ---------------------------------------------------------------------------
 
 async function generateSessionSummary(sessionId) {
   const db      = getDb();
@@ -564,10 +544,6 @@ Sluit af met een motiverende zin voor de komende week.`;
 
   return response.content[0].text;
 }
-
-// ---------------------------------------------------------------------------
-// Generic fallback response
-// ---------------------------------------------------------------------------
 
 async function generateGenericResponse(userMessage, recentHistory = []) {
   const messages = [

@@ -43,12 +43,24 @@ function setMessageSender(fn) {
 }
 
 // ---------------------------------------------------------------------------
+// Word-boundary helper (avoids 'einde' matching 'eindelijk', etc.)
+// ---------------------------------------------------------------------------
+
+function _matchesAnyWord(message, keywords) {
+  if (!message) return false;
+  return keywords.some(kw => {
+    if (/\s/.test(kw)) {
+      return message.toLowerCase().includes(kw.toLowerCase());
+    }
+    return new RegExp(`\\b${kw}\\b`, 'i').test(message);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main router
 // ---------------------------------------------------------------------------
 
 async function handleIncomingMessage(text, channel) {
-  // Auto-close any user_chat that has been idle too long, so the user doesn't
-  // get stuck in chat mode (which suppresses scheduled reminders).
   if (isConversationStale()) {
     logger.info('user_chat verlopen door inactiviteit — automatisch afgesloten');
     clearConversationState();
@@ -62,8 +74,7 @@ async function handleIncomingMessage(text, channel) {
     return await _handleFridayMessage(text, state);
   }
 
-  // 2. Response to a pending habit reminder — checked BEFORE user_chat so that
-  //    a reply to a reminder is never swallowed by an ongoing conversation.
+  // 2. Response to a pending habit reminder
   const pending = getPendingReminders();
   const habitIds = Object.keys(pending);
   if (habitIds.length > 0) {
@@ -95,10 +106,8 @@ async function handleIncomingMessage(text, channel) {
     }
   }
 
-  // 3. Friday-session intent — checked BEFORE user_chat so the user can
-  //    request a (re-)start of the weekly reflection at any time.
+  // 3. Friday-session intent (start or resume)
   if (await detectFridaySessionIntent(text)) {
-    // Clear any lingering chat state so the session takes over cleanly.
     if (state.type === 'user_chat') {
       clearConversationState();
     }
@@ -106,7 +115,7 @@ async function handleIncomingMessage(text, channel) {
     return;
   }
 
-  // 4. Active user-initiated chat — continue with history, don't restart
+  // 4. Active user-initiated chat
   if (state.type === 'user_chat') {
     return await _handleUserChatMessage(text, state, channel);
   }
@@ -133,7 +142,7 @@ async function handleIncomingMessage(text, channel) {
 // ---------------------------------------------------------------------------
 
 const STOP_WORDS = ['klaar', 'stop', 'afsluiten', 'einde', 'bye', 'doei', 'tot later', 'done'];
-const MAX_HISTORY = 20; // max berichten bewaard in geheugen
+const MAX_HISTORY = 20;
 
 async function _startUserChat(text, channel) {
   const reply = await generateGenericResponse(text, []);
@@ -151,7 +160,9 @@ async function _startUserChat(text, channel) {
 }
 
 async function _handleUserChatMessage(text, state, channel) {
-  const wantsToStop = STOP_WORDS.some(w => text.toLowerCase().includes(w));
+  // Whole-word match so 'klaar' doesn't match 'klaarwakker'
+  // and 'einde' doesn't match 'eindelijk'.
+  const wantsToStop = _matchesAnyWord(text, STOP_WORDS);
 
   if (wantsToStop) {
     clearConversationState();
@@ -163,7 +174,6 @@ async function _handleUserChatMessage(text, state, channel) {
   const history = state.history || [];
   const reply   = await generateGenericResponse(text, history);
 
-  // Append new exchange and cap history to avoid unbounded growth
   const updatedHistory = [
     ...history,
     { role: 'user',      content: text  },
@@ -183,7 +193,6 @@ async function _handleFridayMessage(text, state) {
 
   const result = await processFridaySession(text, state);
 
-  // Log any side effects from the session step (e.g. todos persisted)
   if (Array.isArray(result.sideEffects)) {
     for (const note of result.sideEffects) {
       logger.info(`Vrijdagsessie ${state.sessionId}: ${note}`);
@@ -262,7 +271,6 @@ async function _recordReminderResponse(pendingReminder, response) {
   const habitId   = pendingReminder.habitId;
   const completed = response === 'completed' ? 1 : 0;
 
-  // Update the exact reminder we sent, identified by its primary key
   db.prepare('UPDATE reminders SET response = ?, completed = ? WHERE id = ?')
     .run(response, completed, pendingReminder.reminderId);
 
