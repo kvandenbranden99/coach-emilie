@@ -15,7 +15,10 @@ const logger                                   = require('./utils/logger');
 // ---------------------------------------------------------------------------
 
 async function sendMessage(text, forceChannel = null) {
-  const channel = determineChannel(forceChannel);
+  // determineChannel is async (it can do a Calendar call), so AWAIT it.
+  // Without await, `channel` is a Promise, which is never === 'slack' and
+  // every message would silently fall through to Telegram.
+  const channel = await determineChannel(forceChannel);
 
   try {
     if (channel === 'slack') {
@@ -113,7 +116,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // Use console.error here in case the logger itself hasn't initialised yet
   console.error('Kritieke fout bij opstarten:', err);
   process.exit(1);
 });
