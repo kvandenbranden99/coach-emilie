@@ -73,6 +73,14 @@ async function handleIncomingMessage(text, channel) {
     if (handled) return;
   }
 
+  // 2b. Late habit update — gebruiker meldt achteraf dat een eerder
+  //     declined of niet-beantwoorde habit van vandaag tóch nog gedaan is.
+  //     Pas alleen aan als het bericht plausibel over een habit gaat.
+  if (_messageMentionsHabits(text)) {
+    const handled = await _handleLateHabitUpdate(text, channel);
+    if (handled) return;
+  }
+
   // 3. Friday-session intent
   if (await detectFridaySessionIntent(text)) {
     if (state.type === 'user_chat') {
@@ -162,6 +170,126 @@ async function _handlePendingRemindersResponse(text, pending, habitIds, channel)
   await _sendMessage(reply, channel);
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Late habit update — handle "ah ja ik heb het tóch nog gedaan" boodschappen
+// die binnenkomen NA de pending reminder gewist is (bv. door eerdere decline).
+// ---------------------------------------------------------------------------
+
+/**
+ * Goedkope keyword-check vooraf: alleen als het bericht plausibel over
+ * een habit gaat, gaan we Claude lastigvallen met een AI-call.
+ */
+function _messageMentionsHabits(text) {
+  if (!text) return false;
+  const db = getDb();
+  const habits = db.prepare('SELECT name, description FROM habits WHERE active = 1').all();
+
+  const habitWords = [];
+  for (const h of habits) {
+    // Splits habit-naam in losse betekenisvolle woorden (>3 letters)
+    const words = `${h.name} ${h.description || ''}`
+      .toLowerCase()
+      .split(/[\s,.\-/]+/)
+      .filter(w => w.length > 3);
+    habitWords.push(...words);
+  }
+
+  // Generieke status-woorden die op een habit-update kunnen wijzen
+  const statusWords = [
+    'gedaan', 'voltooid', 'gehaald', 'gelukt', 'afgevinkt', 'gehaald',
+    'overgeslagen', 'niet gelukt', 'mis', 'gemist', 'vergeten'
+  ];
+
+  const lower = text.toLowerCase();
+  const hasHabitWord = habitWords.some(w => lower.includes(w));
+  const hasStatusWord = statusWords.some(w => lower.includes(w));
+
+  // Beide nodig: bericht moet over een specifieke habit gaan EN status melden
+  return hasHabitWord && hasStatusWord;
+}
+
+/**
+ * Probeer het bericht te interpreteren als een late update voor een habit
+ * van vandaag (bijv. "ziezo, mijn 10000 stappen heb ik nu toch gedaan").
+ * Zoekt voor elke vandaag-habit de meest recente reminder van vandaag op
+ * en past die aan als het bericht ondubbelzinnig completed/declined zegt.
+ *
+ * Returns true als er minstens één DB-update is gebeurd (caller stopt dan
+ * de routing). Returns false als er niets aangepast werd, zodat de gewone
+ * chat-flow wordt voortgezet.
+ */
+async function _handleLateHabitUpdate(text, channel) {
+  const db = getDb();
+  const today = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-MM-dd');
+
+  // Zoek alle habits van vandaag die ALLEEN een reminder kregen — niet alleen
+  // de actieve, maar gefilterd op "heeft een reminder vandaag".
+  const habitsToday = db.prepare(`
+    SELECT DISTINCT h.id, h.name
+    FROM habits h
+    JOIN reminders r ON r.habit_id = h.id
+    WHERE h.active = 1 AND r.date = ?
+  `).all(today);
+
+  if (habitsToday.length === 0) return false;
+
+  // Vraag Claude welke van deze habits het bericht expliciet noemt
+  const responses = await detectMultiHabitResponses(text, habitsToday);
+
+  let updatedCount  = 0;
+  const completedNames = [];
+  const declinedNames  = [];
+
+  for (const habit of habitsToday) {
+    const status = responses[habit.name];
+    if (status !== 'completed' && status !== 'declined') continue;
+
+    // Pak de meest recente reminder van vandaag voor deze habit
+    const latest = db.prepare(`
+      SELECT id, response, completed FROM reminders
+      WHERE habit_id = ? AND date = ?
+      ORDER BY sent_at DESC LIMIT 1
+    `).get(habit.id, today);
+    if (!latest) continue;
+
+    const newCompleted = status === 'completed' ? 1 : 0;
+
+    // Als de status al hetzelfde is, niets doen — anders raken we door de
+    // pending-flow en deze flow dezelfde reminder twee keer aan.
+    if (latest.response === status && latest.completed === newCompleted) continue;
+
+    db.prepare('UPDATE reminders SET response = ?, completed = ? WHERE id = ?')
+      .run(status, newCompleted, latest.id);
+
+    logger.info(`Late update: herinnering #${latest.id} (${habit.name}) → ${status}`);
+    updatedCount++;
+    if (status === 'completed') completedNames.push(habit.name);
+    else                        declinedNames.push(habit.name);
+  }
+
+  if (updatedCount === 0) return false;
+
+  let reply;
+  if (completedNames.length > 0 && declinedNames.length === 0) {
+    if (completedNames.length === 1) {
+      reply = `Top dat je "${completedNames[0]}" toch nog gedaan hebt! 💪 Aangepast.`;
+    } else {
+      reply = `Top! 💪 Ik heb ${completedNames.map(n => `"${n}"`).join(' en ')} alsnog op gedaan gezet.`;
+    }
+  } else if (declinedNames.length > 0 && completedNames.length === 0) {
+    reply = `Oké, ${declinedNames.map(n => `"${n}"`).join(' en ')} laten we voor vandaag staan. 👍`;
+  } else {
+    reply = `Aangepast — ${completedNames.map(n => `"${n}"`).join(' en ')} op gedaan, ${declinedNames.map(n => `"${n}"`).join(' en ')} blijft staan. 👍`;
+  }
+
+  await _sendMessage(reply, channel);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// User-initiated chat handlers
+// ---------------------------------------------------------------------------
 
 const STOP_WORDS = ['klaar', 'stop', 'afsluiten', 'einde', 'bye', 'doei', 'tot later', 'done'];
 const MAX_HISTORY = 20;
