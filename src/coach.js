@@ -12,17 +12,9 @@ const TIMEZONE = process.env.TIMEZONE || 'Europe/Brussels';
 // Word-boundary helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Returns true if the message contains any of the keywords as a whole word
- * (case-insensitive). Avoids false positives like "einde" matching
- * "eindelijk" or "klaar" matching "klaarwakker".
- */
 function _matchesAnyWord(message, keywords) {
   if (!message) return false;
   return keywords.some(kw => {
-    // Multi-word keyword: do a simple includes (only against word breaks
-    // is hard cross-language, and these are common phrases that only appear
-    // intentionally).
     if (/\s/.test(kw)) {
       return message.toLowerCase().includes(kw.toLowerCase());
     }
@@ -86,6 +78,11 @@ async function generateHabitReminder(habit, period, attemptNumber) {
   return response.content[0].text;
 }
 
+/**
+ * (Legacy) classify a user message as 'completed', 'declined', or 'unknown'
+ * for a single habit. Kept for backwards compatibility — for multi-habit
+ * scenarios use detectMultiHabitResponses below.
+ */
 async function detectResponse(userMessage, habitName = null) {
   const subject = habitName ? `"${habitName}"` : 'de gevraagde taak';
   const response = await client.messages.create({
@@ -93,9 +90,8 @@ async function detectResponse(userMessage, habitName = null) {
     max_tokens: 10,
     system:     `Analyseer of het bericht aangeeft dat de gebruiker ${subject} gedaan heeft (positief) of niet kan/wil doen (negatief).
 Als het bericht meerdere gewoonten bespreekt, beoordeel dan uitsluitend of ${subject} als gedaan wordt gemeld.
-Antwoord enkel met één woord: "completed", "declined", of "unknown".
-Voorbeelden positief: gedaan, klaar, ✓, 👍, ja, gelukt, oké, al gehaald.
-Voorbeelden negatief: nee, geen tijd, kan niet, later, straks, nog niet, ❌, overgeslagen.`,
+Als het bericht ${subject} niet noemt, antwoord dan "unknown".
+Antwoord enkel met één woord: "completed", "declined", of "unknown".`,
     messages:   [{ role: 'user', content: userMessage }]
   });
 
@@ -103,6 +99,83 @@ Voorbeelden negatief: nee, geen tijd, kan niet, later, straks, nog niet, ❌, ov
   if (result.includes('completed')) return 'completed';
   if (result.includes('declined'))  return 'declined';
   return 'unknown';
+}
+
+/**
+ * Classify a user message against MULTIPLE pending habits in a single call.
+ * Returns an object keyed by habit name, with values 'completed' | 'declined'
+ * | 'not_mentioned'. Habits that aren't specifically referenced should be
+ * marked 'not_mentioned' so we don't accidentally close them out.
+ *
+ * @param {string} userMessage
+ * @param {Array<{id: number|string, name: string, period?: string}>} habits
+ * @returns {Promise<Object<string, 'completed'|'declined'|'not_mentioned'>>}
+ */
+async function detectMultiHabitResponses(userMessage, habits) {
+  if (!userMessage || !habits || habits.length === 0) return {};
+
+  // Build a numbered list for the prompt
+  const habitList = habits
+    .map((h, i) => {
+      const periodHint = h.period ? ` (${periodLabels[h.period] || h.period})` : '';
+      return `${i + 1}. "${h.name}"${periodHint}`;
+    })
+    .join('\n');
+
+  // Default everyone to not_mentioned
+  const result = {};
+  habits.forEach(h => { result[h.name] = 'not_mentioned'; });
+
+  try {
+    const response = await client.messages.create({
+      model:      MODEL,
+      max_tokens: 200,
+      system: `Je analyseert een bericht van een gebruiker tegen een lijst van openstaande
+gewoonten. Voor ELKE gewoonte beoordeel je:
+- "completed" → de gebruiker meldt SPECIFIEK dat deze gewoonte gedaan is.
+- "declined"  → de gebruiker meldt SPECIFIEK dat deze gewoonte (nu) niet kan/wil.
+- "not_mentioned" → de gewoonte wordt niet expliciet besproken in het bericht.
+
+Wees STRIKT. Bij twijfel kies "not_mentioned". Een algemeen "ja" of "gedaan"
+zonder verwijzing naar een specifieke gewoonte → markeer ALLEEN de gewoonte
+die in de allerlaatste herinnering aan bod kwam, of "not_mentioned" als dat
+onduidelijk is. Het is veel erger om een gewoonte ten onrechte als "completed"
+te markeren dan om hem als "not_mentioned" over te slaan.
+
+Antwoord uitsluitend met geldige JSON in dit formaat (zonder markdown):
+{
+  "1": "completed",
+  "2": "not_mentioned"
+}
+
+De keys zijn de nummers uit de lijst, de values zijn "completed", "declined" of "not_mentioned".`,
+      messages: [{
+        role: 'user',
+        content: `Lijst van openstaande gewoonten:
+${habitList}
+
+Bericht van de gebruiker:
+"${userMessage}"`
+      }]
+    });
+
+    const text  = response.content[0].text.trim();
+    const clean = text.replace(/^```json\s*|\s*```$/g, '').trim();
+    const parsed = JSON.parse(clean);
+
+    // Map back to habit names
+    habits.forEach((h, i) => {
+      const value = parsed[String(i + 1)];
+      if (value === 'completed' || value === 'declined' || value === 'not_mentioned') {
+        result[h.name] = value;
+      }
+    });
+  } catch (err) {
+    logger.error('Fout bij detectMultiHabitResponses:', err.message);
+    // On error, leave everything as 'not_mentioned' (safer than misclassifying)
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,13 +253,9 @@ const FRIDAY_STEPS = [
 
 const MULTI_TURN_STEPS = new Set(['todo_review', 'new_todos']);
 
-/**
- * Detect whether the user signals they are done with the current multi-turn step.
- */
 async function _detectStepDone(userMessage, stepContext) {
   if (!userMessage) return false;
 
-  // Cheap whole-word match first
   const doneKeywords = [
     'klaar', 'genoeg', 'volgende', 'verder', 'door', 'next',
     'dat is alles', 'dat was het', 'meer niet', 'ga door', 'ga maar door',
@@ -194,7 +263,6 @@ async function _detectStepDone(userMessage, stepContext) {
   ];
   if (_matchesAnyWord(userMessage, doneKeywords)) return true;
 
-  // AI fallback for ambiguous phrasings
   try {
     const response = await client.messages.create({
       model:      MODEL,
@@ -220,13 +288,10 @@ Antwoord enkel met "ja" of "nee".`,
     return response.content[0].text.trim().toLowerCase().startsWith('ja');
   } catch (err) {
     logger.error('Fout bij _detectStepDone:', err.message);
-    return false; // safer to stay on the current step than to skip it
+    return false;
   }
 }
 
-/**
- * Extract concrete todos from session conversation history.
- */
 async function _extractTodosFromHistory(history) {
   if (!history || history.length === 0) return [];
 
@@ -327,8 +392,6 @@ async function processFridaySession(userMessage, sessionState) {
   const db = getDb();
   const { sessionId, step, history } = sessionState;
 
-  // Detect explicit close request — uses whole-word matching so 'einde'
-  // doesn't match inside 'eindelijk', etc.
   const closeWords = ['einde', 'afsluiten', 'finish', 'beëindig'];
   const wantsToClose = _matchesAnyWord(userMessage, closeWords);
 
@@ -564,6 +627,7 @@ async function generateGenericResponse(userMessage, recentHistory = []) {
 module.exports = {
   generateHabitReminder,
   detectResponse,
+  detectMultiHabitResponses,
   detectFridaySessionIntent,
   processFridaySession,
   generateWeekReport,

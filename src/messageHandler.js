@@ -10,7 +10,7 @@ const {
 
 const {
   processFridaySession,
-  detectResponse,
+  detectMultiHabitResponses,
   detectFridaySessionIntent,
   generateGenericResponse,
   generateSessionSummary
@@ -35,16 +35,11 @@ const logger = require('./utils/logger');
 
 const TIMEZONE = process.env.TIMEZONE || 'Europe/Brussels';
 
-// Injected at startup by index.js
 let _sendMessage = null;
 
 function setMessageSender(fn) {
   _sendMessage = fn;
 }
-
-// ---------------------------------------------------------------------------
-// Word-boundary helper (avoids 'einde' matching 'eindelijk', etc.)
-// ---------------------------------------------------------------------------
 
 function _matchesAnyWord(message, keywords) {
   if (!message) return false;
@@ -56,10 +51,6 @@ function _matchesAnyWord(message, keywords) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Main router
-// ---------------------------------------------------------------------------
-
 async function handleIncomingMessage(text, channel) {
   if (isConversationStale()) {
     logger.info('user_chat verlopen door inactiviteit — automatisch afgesloten');
@@ -69,44 +60,20 @@ async function handleIncomingMessage(text, channel) {
   const state = getConversationState();
   logger.info(`Inkomend bericht [${channel}]: "${text}" | staat: ${state.type}`);
 
-  // 1. Active Friday session — let it handle its own flow first
+  // 1. Active Friday session
   if (state.type === 'friday_session') {
     return await _handleFridayMessage(text, state);
   }
 
-  // 2. Response to a pending habit reminder
+  // 2. Response to pending habit reminders (multi-habit aware)
   const pending = getPendingReminders();
   const habitIds = Object.keys(pending);
   if (habitIds.length > 0) {
-    const db = getDb();
-    let completedCount = 0;
-    let declinedCount  = 0;
-
-    for (const habitId of habitIds) {
-      const habit    = db.prepare('SELECT name FROM habits WHERE id = ?').get(habitId);
-      const response = await detectResponse(text, habit ? habit.name : null);
-      if (response !== 'unknown') {
-        await _recordReminderResponse(pending[habitId], response);
-        if (response === 'completed') completedCount++;
-        else declinedCount++;
-      }
-    }
-
-    if (completedCount > 0 || declinedCount > 0) {
-      let reply;
-      if (completedCount > 0 && declinedCount === 0) {
-        reply = 'Super gedaan! 💪 Ik heb het geregistreerd.';
-      } else if (declinedCount > 0 && completedCount === 0) {
-        reply = 'Geen probleem, ik probeer het later opnieuw. 👍';
-      } else {
-        reply = 'Super gedaan met wat je al hebt gedaan! 💪 Voor de rest probeer ik het later opnieuw. 👍';
-      }
-      await _sendMessage(reply, channel);
-      return;
-    }
+    const handled = await _handlePendingRemindersResponse(text, pending, habitIds, channel);
+    if (handled) return;
   }
 
-  // 3. Friday-session intent (start or resume)
+  // 3. Friday-session intent
   if (await detectFridaySessionIntent(text)) {
     if (state.type === 'user_chat') {
       clearConversationState();
@@ -133,13 +100,68 @@ async function handleIncomingMessage(text, channel) {
     return await _handleHabitIntent(intent, text, channel);
   }
 
-  // 7. No active session — start a new user chat and track history
+  // 7. No active session — start a new user chat
   return await _startUserChat(text, channel);
 }
 
-// ---------------------------------------------------------------------------
-// User-initiated chat handlers
-// ---------------------------------------------------------------------------
+async function _handlePendingRemindersResponse(text, pending, habitIds, channel) {
+  const db = getDb();
+
+  const habitsForDetection = [];
+  const pendingByName = {};
+  for (const habitId of habitIds) {
+    const habit = db.prepare('SELECT name FROM habits WHERE id = ?').get(habitId);
+    if (!habit) continue;
+    const reminder = pending[habitId];
+    habitsForDetection.push({
+      id:     habitId,
+      name:   habit.name,
+      period: reminder ? reminder.period : null
+    });
+    pendingByName[habit.name] = reminder;
+  }
+  if (habitsForDetection.length === 0) return false;
+
+  const responses = await detectMultiHabitResponses(text, habitsForDetection);
+
+  let completedCount = 0;
+  let declinedCount  = 0;
+  const completedNames = [];
+  const declinedNames  = [];
+
+  for (const habit of habitsForDetection) {
+    const status = responses[habit.name];
+    if (status === 'completed') {
+      await _recordReminderResponse(pendingByName[habit.name], 'completed');
+      completedCount++;
+      completedNames.push(habit.name);
+    } else if (status === 'declined') {
+      await _recordReminderResponse(pendingByName[habit.name], 'declined');
+      declinedCount++;
+      declinedNames.push(habit.name);
+    }
+  }
+
+  if (completedCount === 0 && declinedCount === 0) {
+    return false;
+  }
+
+  let reply;
+  if (completedCount > 0 && declinedCount === 0) {
+    if (completedNames.length === 1) {
+      reply = `Super gedaan met "${completedNames[0]}"! 💪 Geregistreerd.`;
+    } else {
+      reply = `Super gedaan! 💪 Ik heb ${completedNames.map(n => `"${n}"`).join(' en ')} geregistreerd.`;
+    }
+  } else if (declinedCount > 0 && completedCount === 0) {
+    reply = 'Geen probleem, ik probeer het later opnieuw. 👍';
+  } else {
+    reply = `Top dat je ${completedNames.map(n => `"${n}"`).join(' en ')} hebt gedaan! 💪 Voor ${declinedNames.map(n => `"${n}"`).join(' en ')} probeer ik het later opnieuw. 👍`;
+  }
+
+  await _sendMessage(reply, channel);
+  return true;
+}
 
 const STOP_WORDS = ['klaar', 'stop', 'afsluiten', 'einde', 'bye', 'doei', 'tot later', 'done'];
 const MAX_HISTORY = 20;
@@ -160,8 +182,6 @@ async function _startUserChat(text, channel) {
 }
 
 async function _handleUserChatMessage(text, state, channel) {
-  // Whole-word match so 'klaar' doesn't match 'klaarwakker'
-  // and 'einde' doesn't match 'eindelijk'.
   const wantsToStop = _matchesAnyWord(text, STOP_WORDS);
 
   if (wantsToStop) {
@@ -184,10 +204,6 @@ async function _handleUserChatMessage(text, state, channel) {
   await _sendMessage(reply, channel);
 }
 
-// ---------------------------------------------------------------------------
-// Friday session handler
-// ---------------------------------------------------------------------------
-
 async function _handleFridayMessage(text, state) {
   const db = getDb();
 
@@ -199,7 +215,6 @@ async function _handleFridayMessage(text, state) {
     }
   }
 
-  // Friday session always goes via Telegram
   await _sendMessage(result.responseText, 'telegram');
 
   if (result.isComplete) {
@@ -220,10 +235,6 @@ async function _handleFridayMessage(text, state) {
     setConversationState({ ...state, step: result.nextStep, history: newHistory });
   }
 }
-
-// ---------------------------------------------------------------------------
-// Habit management handler
-// ---------------------------------------------------------------------------
 
 async function _handleHabitIntent(intent, message, channel) {
   let reply;
@@ -262,11 +273,8 @@ async function _handleHabitIntent(intent, message, channel) {
   await _sendMessage(reply, channel);
 }
 
-// ---------------------------------------------------------------------------
-// Record reminder response in DB
-// ---------------------------------------------------------------------------
-
 async function _recordReminderResponse(pendingReminder, response) {
+  if (!pendingReminder) return;
   const db        = getDb();
   const habitId   = pendingReminder.habitId;
   const completed = response === 'completed' ? 1 : 0;
