@@ -11,6 +11,7 @@ const {
 const {
   processFridaySession,
   detectResponse,
+  detectFridaySessionIntent,
   generateGenericResponse,
   generateSessionSummary
 } = require('./coach');
@@ -27,6 +28,7 @@ const {
   INTENT
 } = require('./habitManager');
 
+const { triggerFridaySessionFromUser } = require('./scheduler');
 const { getDb } = require('./database/db');
 const { DateTime } = require('luxon');
 const logger = require('./utils/logger');
@@ -55,7 +57,7 @@ async function handleIncomingMessage(text, channel) {
   const state = getConversationState();
   logger.info(`Inkomend bericht [${channel}]: "${text}" | staat: ${state.type}`);
 
-  // 1. Active Friday session
+  // 1. Active Friday session — let it handle its own flow first
   if (state.type === 'friday_session') {
     return await _handleFridayMessage(text, state);
   }
@@ -93,25 +95,36 @@ async function handleIncomingMessage(text, channel) {
     }
   }
 
-  // 3. Active user-initiated chat — continue with history, don't restart
+  // 3. Friday-session intent — checked BEFORE user_chat so the user can
+  //    request a (re-)start of the weekly reflection at any time.
+  if (await detectFridaySessionIntent(text)) {
+    // Clear any lingering chat state so the session takes over cleanly.
+    if (state.type === 'user_chat') {
+      clearConversationState();
+    }
+    await triggerFridaySessionFromUser(channel);
+    return;
+  }
+
+  // 4. Active user-initiated chat — continue with history, don't restart
   if (state.type === 'user_chat') {
     return await _handleUserChatMessage(text, state, channel);
   }
 
-  // 4. In-progress habit-addition conversation
+  // 5. In-progress habit-addition conversation
   if (getHabitConversationState()) {
     const reply = await processAddHabitStep(text);
     if (reply) await _sendMessage(reply, channel);
     return;
   }
 
-  // 5. Habit management intent
+  // 6. Habit management intent
   const intent = await detectHabitManagementIntent(text);
   if (intent) {
     return await _handleHabitIntent(intent, text, channel);
   }
 
-  // 6. No active session — start a new user chat and track history
+  // 7. No active session — start a new user chat and track history
   return await _startUserChat(text, channel);
 }
 

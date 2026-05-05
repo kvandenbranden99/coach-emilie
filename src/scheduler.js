@@ -2,7 +2,11 @@ const cron = require('node-cron');
 const { DateTime } = require('luxon');
 
 const { getDb } = require('./database/db');
-const { generateHabitReminder, generateWeekReport } = require('./coach');
+const {
+  generateHabitReminder,
+  generateWeekReport,
+  FRIDAY_STEPS
+} = require('./coach');
 const { determineChannel } = require('./channelRouter');
 const { isCurrentlyFree } = require('./calendar');
 const {
@@ -191,7 +195,7 @@ async function _sendReminderIfFree(habit, period, now, dateStr, bounds, attemptN
 }
 
 // ---------------------------------------------------------------------------
-// Friday session
+// Friday session — scheduled (cron) version
 // ---------------------------------------------------------------------------
 
 async function startFridaySession() {
@@ -250,6 +254,145 @@ async function startFridaySession() {
 }
 
 // ---------------------------------------------------------------------------
+// Friday session — user-triggered version (resume or start fresh)
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine the next step for an existing (open) Friday session
+ * by inspecting which fields are already filled in the DB.
+ */
+function _inferNextStepForOpenSession(session) {
+  // Map filled fields to the next logical question.
+  // The session table only persists went_well, was_difficult and grateful_for,
+  // so for the in-between steps we can only tell "we are past went_well",
+  // "we are past was_difficult", etc. We always restart on the *next* unanswered
+  // question.
+  if (!session.went_well)     return 'went_well';
+  if (!session.was_difficult) return 'was_difficult';
+  if (!session.grateful_for)  return 'gratitude';
+  return 'closing';
+}
+
+/**
+ * Load the assistant/user history for a session from conversation_history,
+ * trimmed to the most recent N turns to keep the context manageable.
+ */
+function _loadSessionHistory(sessionId, limit = 30) {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT role, content
+    FROM conversation_history
+    WHERE session_type = 'friday_session' AND session_id = ?
+    ORDER BY id ASC
+  `).all(sessionId);
+
+  // Keep only the last `limit` turns
+  return rows.slice(-limit).map(r => ({ role: r.role, content: r.content }));
+}
+
+/**
+ * User-triggered Friday session.
+ *  - If an open session for this week exists → resume from the next unanswered step.
+ *  - Otherwise → start a brand new session, including week report.
+ *
+ * @param {string} channel  channel the user triggered from ('telegram' | 'slack')
+ */
+async function triggerFridaySessionFromUser(channel = 'telegram') {
+  const now = DateTime.now().setZone(TIMEZONE);
+  const db  = getDb();
+
+  // Look for an existing OPEN session this week
+  const existing = db.prepare(`
+    SELECT * FROM friday_sessions
+    WHERE week_number = ? AND year = ? AND ended_at IS NULL
+    ORDER BY id DESC LIMIT 1
+  `).get(now.weekNumber, now.year);
+
+  if (existing) {
+    return await _resumeFridaySession(existing, channel);
+  }
+  return await _startFridaySessionForUser(channel);
+}
+
+async function _resumeFridaySession(session, channel) {
+  const nextStep = _inferNextStepForOpenSession(session);
+  const history  = _loadSessionHistory(session.id);
+
+  setConversationState({
+    type:      'friday_session',
+    sessionId: session.id,
+    step:      nextStep,
+    history
+  });
+
+  // Friday session always goes via Telegram, but we acknowledge
+  // on the channel the user used so they know it has been picked up.
+  if (channel !== 'telegram') {
+    await _sendMessage('Ik pak de vrijdagsessie op in Telegram. 📲', channel);
+  }
+  await _sendMessage(
+    'We pakken onze wekelijkse check-in weer op waar we gestopt zijn. 😊',
+    'telegram'
+  );
+
+  // Re-ask the appropriate question for the step we land on
+  const followUp = {
+    went_well:     'Wat is er goed gegaan deze week? 🌟',
+    was_difficult: 'Wat was er moeilijk deze week?',
+    gratitude:     'Waar ben je dankbaar voor deze week?',
+    closing:       'We hadden eigenlijk al alles besproken. Wil je nog iets toevoegen voor we afsluiten?'
+  };
+  await _sendMessage(followUp[nextStep] || followUp.went_well, 'telegram');
+
+  logger.info(`Vrijdagsessie ${session.id} hervat op stap "${nextStep}"`);
+}
+
+async function _startFridaySessionForUser(channel) {
+  const now = DateTime.now().setZone(TIMEZONE);
+  const db  = getDb();
+
+  logger.info('Vrijdagsessie gestart op vraag van gebruiker');
+
+  const { lastInsertRowid: sessionId } = db.prepare(`
+    INSERT INTO friday_sessions (week_number, year) VALUES (?, ?)
+  `).run(now.weekNumber, now.year);
+
+  setConversationState({
+    type:      'friday_session',
+    sessionId,
+    step:      'opening',
+    history:   []
+  });
+
+  if (channel !== 'telegram') {
+    await _sendMessage('Ik start onze wekelijkse check-in op in Telegram. 📲', channel);
+  }
+  await _sendMessage('Tijd voor onze wekelijkse check-in. 😊', 'telegram');
+
+  // Brief pause, then send the week report + first question
+  setTimeout(async () => {
+    try {
+      const report = await generateWeekReport(now.weekNumber, now.year);
+      await _sendMessage(report, 'telegram');
+
+      setConversationState({
+        type:      'friday_session',
+        sessionId,
+        step:      'went_well',
+        history:   [
+          { role: 'assistant', content: 'Tijd voor onze wekelijkse check-in. 😊' },
+          { role: 'assistant', content: report }
+        ]
+      });
+
+      await _sendMessage('Wat is er goed gegaan deze week? 🌟', 'telegram');
+    } catch (err) {
+      logger.error('Fout na opening (user-triggered) vrijdagsessie:', err.message);
+    }
+  }, 2500);
+}
+
+// ---------------------------------------------------------------------------
 // Midnight cleanup
 // ---------------------------------------------------------------------------
 
@@ -273,4 +416,9 @@ async function midnightCleanup() {
   logger.info(`Nachtopruiming voltooid voor ${dateStr}`);
 }
 
-module.exports = { initScheduler, setMessageSender, startFridaySession };
+module.exports = {
+  initScheduler,
+  setMessageSender,
+  startFridaySession,
+  triggerFridaySessionFromUser
+};

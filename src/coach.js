@@ -91,6 +91,75 @@ Voorbeelden negatief: nee, geen tijd, kan niet, later, straks, nog niet, ❌, ov
 }
 
 // ---------------------------------------------------------------------------
+// Friday session intent detection
+// ---------------------------------------------------------------------------
+
+// Fast keyword match — covers the obvious cases without an AI call
+const FRIDAY_KEYWORDS = [
+  'vrijdagsessie',
+  'vrijdag sessie',
+  'weekreflectie',
+  'week reflectie',
+  'wekelijkse check-in',
+  'wekelijkse checkin',
+  'weekoverzicht',
+  'week overzicht',
+  'inhaalsessie',
+  'inhaal sessie',
+  'check-in nu',
+  'checkin nu',
+  'reflectie nu'
+];
+
+/**
+ * Returns true if the user's message expresses an intent to start (or resume)
+ * a Friday-session-style weekly reflection.
+ *
+ * First tries a cheap keyword check, then falls back to a small Claude call
+ * for natural-language phrasings ("laten we de week overlopen", etc.).
+ */
+async function detectFridaySessionIntent(userMessage) {
+  if (!userMessage) return false;
+  const lower = userMessage.toLowerCase();
+
+  // 1. Fast keyword match
+  if (FRIDAY_KEYWORDS.some(kw => lower.includes(kw))) {
+    return true;
+  }
+
+  // 2. AI fallback for natural phrasings
+  try {
+    const response = await client.messages.create({
+      model:      MODEL,
+      max_tokens: 5,
+      system:     `Beoordeel of het bericht van de gebruiker uitdrukkelijk vraagt om een wekelijkse reflectie- of evaluatiesessie te starten.
+Voorbeelden die "ja" zijn:
+- "laten we de week overlopen"
+- "kunnen we nu reflecteren over deze week?"
+- "doe maar een check-in"
+- "ik wil de week eens bespreken"
+- "tijd voor een evaluatie"
+- "weekgesprek graag"
+
+Voorbeelden die "nee" zijn:
+- gewone antwoorden op herinneringen ("gedaan", "nee", "later")
+- algemene vragen of small talk
+- vragen over een specifieke gewoonte
+- "hoi", "hallo", "hoe gaat het"
+
+Antwoord enkel met één woord: "ja" of "nee".`,
+      messages:   [{ role: 'user', content: userMessage }]
+    });
+
+    const result = response.content[0].text.trim().toLowerCase();
+    return result.startsWith('ja');
+  } catch (err) {
+    logger.error('Fout bij detectFridaySessionIntent:', err.message);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Friday session
 // ---------------------------------------------------------------------------
 
@@ -317,6 +386,7 @@ async function generateGenericResponse(userMessage, recentHistory = []) {
 module.exports = {
   generateHabitReminder,
   detectResponse,
+  detectFridaySessionIntent,
   processFridaySession,
   generateWeekReport,
   generateSessionSummary,
