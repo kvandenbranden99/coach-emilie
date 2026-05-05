@@ -47,9 +47,6 @@ Tijdzone: ${TIMEZONE}`;
 // Habit reminders
 // ---------------------------------------------------------------------------
 
-/**
- * Generate a reminder message for a habit in a given period.
- */
 async function generateHabitReminder(habit, period, attemptNumber) {
   const periodLabel = periodLabels[period] || period;
 
@@ -67,10 +64,6 @@ async function generateHabitReminder(habit, period, attemptNumber) {
   return response.content[0].text;
 }
 
-/**
- * Classify a user message as 'completed', 'declined', or 'unknown'.
- * Pass habitName to evaluate whether that specific habit was completed.
- */
 async function detectResponse(userMessage, habitName = null) {
   const subject = habitName ? `"${habitName}"` : 'de gevraagde taak';
   const response = await client.messages.create({
@@ -94,7 +87,6 @@ Voorbeelden negatief: nee, geen tijd, kan niet, later, straks, nog niet, ❌, ov
 // Friday session intent detection
 // ---------------------------------------------------------------------------
 
-// Fast keyword match — covers the obvious cases without an AI call
 const FRIDAY_KEYWORDS = [
   'vrijdagsessie',
   'vrijdag sessie',
@@ -111,23 +103,14 @@ const FRIDAY_KEYWORDS = [
   'reflectie nu'
 ];
 
-/**
- * Returns true if the user's message expresses an intent to start (or resume)
- * a Friday-session-style weekly reflection.
- *
- * First tries a cheap keyword check, then falls back to a small Claude call
- * for natural-language phrasings ("laten we de week overlopen", etc.).
- */
 async function detectFridaySessionIntent(userMessage) {
   if (!userMessage) return false;
   const lower = userMessage.toLowerCase();
 
-  // 1. Fast keyword match
   if (FRIDAY_KEYWORDS.some(kw => lower.includes(kw))) {
     return true;
   }
 
-  // 2. AI fallback for natural phrasings
   try {
     const response = await client.messages.create({
       model:      MODEL,
@@ -160,47 +143,234 @@ Antwoord enkel met één woord: "ja" of "nee".`,
 }
 
 // ---------------------------------------------------------------------------
-// Friday session
+// Friday session — state machine
 // ---------------------------------------------------------------------------
 
-// Ordered steps in the Friday session
+// Steps in order. Some steps stay active across multiple turns until the user
+// indicates they're done (todo_review, new_todos). Others advance after a
+// single user turn (went_well, was_difficult, gratitude, closing).
 const FRIDAY_STEPS = [
   'opening',
   'went_well',
   'was_difficult',
-  'todo_review',
-  'todo_discussion',
-  'new_todos',
+  'todo_review',   // multi-turn: discuss last week's open todos
+  'new_todos',     // multi-turn: collect this week's new todos
   'gratitude',
   'closing'
 ];
 
+// Steps that may stay active across multiple user turns
+const MULTI_TURN_STEPS = new Set(['todo_review', 'new_todos']);
+
+/**
+ * Detect whether the user signals they are done with the current multi-turn step.
+ * Used to decide whether to advance to the next step or stay.
+ */
+async function _detectStepDone(userMessage, stepContext) {
+  if (!userMessage) return false;
+  const lower = userMessage.toLowerCase();
+
+  // Cheap keyword check first
+  const doneKeywords = [
+    'klaar', 'genoeg', 'dat is alles', 'dat was het', 'meer niet',
+    'volgende', 'ga door', 'ga maar door', 'next', 'volgende vraag',
+    'verder', 'door', 'oké volgende', 'ok volgende'
+  ];
+  if (doneKeywords.some(kw => lower.includes(kw))) return true;
+
+  // AI fallback for ambiguous phrasings
+  try {
+    const response = await client.messages.create({
+      model:      MODEL,
+      max_tokens: 5,
+      system:     `Beoordeel of de gebruiker aangeeft klaar te zijn met de huidige stap van een coaching gesprek.
+Context van de stap: ${stepContext}
+
+Voorbeelden die "ja" zijn (gebruiker wil door):
+- "dat zijn alle to-do's"
+- "verder niets"
+- "we kunnen door"
+- "dat was alles voor vorige week"
+- "geen meer"
+
+Voorbeelden die "nee" zijn (gebruiker is nog inhoud aan het delen):
+- gebruiker noemt nog een nieuwe taak/to-do
+- gebruiker bespreekt details
+- gebruiker stelt een vraag
+
+Antwoord enkel met "ja" of "nee".`,
+      messages:   [{ role: 'user', content: userMessage }]
+    });
+    return response.content[0].text.trim().toLowerCase().startsWith('ja');
+  } catch (err) {
+    logger.error('Fout bij _detectStepDone:', err.message);
+    return false; // safer to stay on the current step than to skip it
+  }
+}
+
+/**
+ * From the conversation history of a session, extract concrete todos
+ * formulated by the user as JSON. Returns an array of objects:
+ *   [{ description, frequency, timesPerWeek }]
+ *
+ * frequency: 'once' | 'weekly' | 'daily'
+ * timesPerWeek: integer (1-7) or null
+ */
+async function _extractTodosFromHistory(history) {
+  if (!history || history.length === 0) return [];
+
+  const transcript = history
+    .map(h => `${h.role === 'user' ? 'Gebruiker' : 'Coach'}: ${h.content}`)
+    .join('\n');
+
+  try {
+    const response = await client.messages.create({
+      model:      MODEL,
+      max_tokens: 600,
+      system: `Je bent een data-extractor. Lees het transcript van een coaching gesprek en
+extraheer ALLEEN de concrete to-do's die de gebruiker zichzelf voor de komende week
+heeft opgelegd. Negeer to-do's van vorige week, gewoonten, en algemene goede voornemens.
+
+Formuleer elke to-do bondig en specifiek. Als de gebruiker een frequentie noemt
+(bv. "drie keer", "elke dag"), gebruik die.
+
+Antwoord uitsluitend met geldige JSON in dit formaat:
+{
+  "todos": [
+    { "description": "...", "frequency": "once|weekly|daily", "timesPerWeek": null }
+  ]
+}
+
+Zonder markdown, zonder commentaar, alleen de JSON. Als er geen to-do's zijn:
+{ "todos": [] }`,
+      messages:   [{ role: 'user', content: transcript }]
+    });
+
+    const text  = response.content[0].text.trim();
+    const clean = text.replace(/^```json\s*|\s*```$/g, '').trim();
+    const parsed = JSON.parse(clean);
+
+    if (!Array.isArray(parsed.todos)) return [];
+    return parsed.todos.filter(t => t && typeof t.description === 'string' && t.description.length > 0);
+  } catch (err) {
+    logger.error('Fout bij _extractTodosFromHistory:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Persist extracted todos for the given session's week.
+ * Returns the number of todos inserted.
+ */
+function _persistTodos(session, todos) {
+  if (!todos || todos.length === 0) return 0;
+  const db = getDb();
+  const insert = db.prepare(`
+    INSERT INTO todos (description, frequency, times_per_week, week_number, year)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertMany = db.transaction((rows) => {
+    for (const t of rows) {
+      insert.run(
+        t.description,
+        t.frequency || 'weekly',
+        t.timesPerWeek || null,
+        session.week_number,
+        session.year
+      );
+    }
+  });
+  insertMany(todos);
+  return todos.length;
+}
+
+/**
+ * Get the open todos from the most recent previous week's session(s),
+ * to be reviewed this week.
+ */
+function _getOpenTodosFromPreviousWeeks(currentSession) {
+  const db = getDb();
+  // Anything from earlier weeks that isn't completed
+  return db.prepare(`
+    SELECT id, description, frequency, times_per_week, week_number, year
+    FROM todos
+    WHERE completed = 0
+      AND (year < ? OR (year = ? AND week_number < ?))
+    ORDER BY year ASC, week_number ASC, id ASC
+  `).all(currentSession.year, currentSession.year, currentSession.week_number);
+}
+
+function formatOpenTodosList(todos) {
+  if (!todos || todos.length === 0) return null;
+  return todos
+    .map((t, i) => `${i + 1}. ${t.description}`)
+    .join('\n');
+}
+
+// Per-step instructions for Claude. The "ask" entries are the literal first
+// question to send when entering that step (used for resume + initial entry).
 const STEP_PROMPTS = {
-  opening:         'Start de sessie met een warme begroeting en kondig aan dat je het weekoverzicht al hebt gestuurd. Vraag wat er goed is gegaan deze week.',
-  went_well:       'De gebruiker heeft geantwoord op "wat ging goed". Reageer kort en positief en vraag daarna: "Wat was er moeilijk deze week?"',
-  was_difficult:   'De gebruiker heeft geantwoord op "wat was moeilijk". Reageer empathisch en vraag of ze de openstaande to-do\'s van vorige week willen bespreken.',
-  todo_review:     'Begeleid het gesprek over de openstaande to-do\'s. Vraag hoe het gegaan is met elk item.',
-  todo_discussion: 'Bespreek de to-do\'s verder. Vraag door bij niet-voltooide taken. Wanneer de gebruiker klaar is, vraag welke to-do\'s ze de komende week willen oppikken of toevoegen.',
-  new_todos:       'Help de gebruiker nieuwe to-do\'s formuleren. Zorg dat elke to-do specifiek en controleerbaar is. Vraag: hoe vaak en wanneer? Als de gebruiker klaar is, stel dan de dankbaarheidsvraag.',
-  gratitude:       'De gebruiker heeft de nieuwe to-do\'s opgegeven. Vraag nu: "Waar ben je dankbaar voor deze week?"',
-  closing:         'De gebruiker heeft de dankbaarheidsvraag beantwoord. Sluit de sessie warm af en laat hen weten dat je zo de samenvatting stuurt.'
+  opening:       'Start de sessie met een warme begroeting en kondig aan dat je het weekoverzicht al hebt gestuurd. Vraag wat er goed is gegaan deze week.',
+  went_well:     'De gebruiker heeft geantwoord op "wat ging goed". Reageer kort en positief. Stel daarna de volgende vraag: "Wat was er moeilijk deze week?"',
+  was_difficult: 'De gebruiker heeft geantwoord op "wat was moeilijk". Reageer empathisch.',
+  todo_review:   `Je bespreekt nu de openstaande to-do's van vorige week, één voor één.
+Vraag bij elk niet-voltooid item: hoe is het gegaan, is het gelukt, of moet het verschoven worden?
+Wanneer alle items besproken zijn, vraag of de gebruiker wil doorgaan naar nieuwe to-do's voor deze week.`,
+  new_todos:     `Je begeleidt nu het opstellen van nieuwe to-do's voor de komende week.
+Vraag de gebruiker naar concrete, specifieke en controleerbare to-do's voor de komende week.
+Vraag voor elk item: hoe vaak en wanneer? Help bij het bondig formuleren.
+Wanneer de gebruiker meerdere to-do's heeft genoemd of aangeeft klaar te zijn, vat ze kort op en bevestig.
+Vraag dan: "Heb je nog meer to-do's of zijn dit ze?"`,
+  gratitude:     'De gebruiker heeft de nieuwe to-do\'s opgegeven. Stel nu de volgende vraag: "Waar ben je dankbaar voor deze week?"',
+  closing:       'De gebruiker heeft de dankbaarheidsvraag beantwoord. Sluit de sessie warm af en laat hen weten dat je zo de samenvatting stuurt.'
 };
 
 /**
- * Process a single turn in the Friday session.
- * Returns { responseText, nextStep, isComplete, extractedData }
+ * Process a single user turn in the Friday session.
+ *
+ * Returns { responseText, nextStep, isComplete, sideEffects }
+ *   sideEffects: optional array of strings to log
  */
 async function processFridaySession(userMessage, sessionState) {
   const db = getDb();
   const { sessionId, step, history } = sessionState;
 
-  // Detect explicit close request
-  const closeWords = ['klaar', 'stop', 'afsluiten', 'einde', 'done', 'finish'];
+  // Detect explicit close request — always wins
+  const closeWords = ['einde', 'afsluiten', 'finish', 'beëindig'];
   const wantsToClose = userMessage
     && closeWords.some(w => userMessage.toLowerCase().includes(w));
 
-  const currentStep = wantsToClose ? 'closing' : step;
-  const stepPrompt  = STEP_PROMPTS[currentStep] || STEP_PROMPTS.closing;
+  // Decide what step to drive this turn from
+  let currentStep = wantsToClose ? 'closing' : step;
+  let nextStep    = currentStep;
+  let stayOnStep  = false;
+  const sideEffects = [];
+
+  // For multi-turn steps, ask: is the user done?
+  if (!wantsToClose && MULTI_TURN_STEPS.has(currentStep)) {
+    const done = await _detectStepDone(userMessage, STEP_PROMPTS[currentStep]);
+    stayOnStep = !done;
+  }
+
+  // When LEAVING the new_todos step, extract and persist todos
+  if (currentStep === 'new_todos' && !stayOnStep) {
+    try {
+      const fullHistory = [
+        ...(history || []),
+        { role: 'user', content: userMessage || '' }
+      ];
+      const todos = await _extractTodosFromHistory(fullHistory);
+      const session = db.prepare('SELECT * FROM friday_sessions WHERE id = ?').get(sessionId);
+      const count = _persistTodos(session, todos);
+      if (count > 0) {
+        sideEffects.push(`${count} to-do(s) opgeslagen voor week ${session.week_number}/${session.year}`);
+      }
+    } catch (err) {
+      logger.error('Fout bij to-do extractie:', err.message);
+    }
+  }
+
+  const stepPrompt = STEP_PROMPTS[currentStep] || STEP_PROMPTS.closing;
 
   // Build conversation history for Claude
   const messages = [
@@ -210,15 +380,31 @@ async function processFridaySession(userMessage, sessionState) {
     messages.push({ role: 'user', content: userMessage });
   }
 
+  // Add open todos info to system prompt during todo_review step
+  let extraContext = '';
+  if (currentStep === 'todo_review') {
+    const session  = db.prepare('SELECT * FROM friday_sessions WHERE id = ?').get(sessionId);
+    const openTodos = _getOpenTodosFromPreviousWeeks(session);
+    if (openTodos.length > 0) {
+      extraContext = `\n\nOpenstaande to-do's van vorige weken:\n${formatOpenTodosList(openTodos)}`;
+    } else {
+      extraContext = `\n\nEr zijn geen openstaande to-do's van vorige weken.`;
+    }
+  }
+
+  const stayHint = stayOnStep
+    ? `\n\nBELANGRIJK: De gebruiker is NOG niet klaar met deze stap. Blijf op deze stap, vraag door of help verder. Stel NIET de volgende vraag.`
+    : '';
+
   const systemPrompt = `${buildSystemPrompt()}
 
 Je leidt momenteel een vrijdagsessie (stap: "${currentStep}").
-Instructie voor deze stap: ${stepPrompt}
+Instructie voor deze stap: ${stepPrompt}${extraContext}${stayHint}
 Reageer passend op het bericht van de gebruiker en leid het gesprek verder.`;
 
   const response = await client.messages.create({
     model:      MODEL,
-    max_tokens: 400,
+    max_tokens: 500,
     system:     systemPrompt,
     messages:   messages.length > 0
       ? messages
@@ -227,19 +413,18 @@ Reageer passend op het bericht van de gebruiker en leid het gesprek verder.`;
 
   const responseText = response.content[0].text;
 
-  // Persist to conversation_history
+  // Persist user message + step-specific data
   if (userMessage) {
     db.prepare(`
       INSERT INTO conversation_history (session_type, session_id, role, content)
       VALUES ('friday_session', ?, 'user', ?)
     `).run(sessionId, userMessage);
 
-    // Save step-specific data
-    if (step === 'went_well') {
+    if (currentStep === 'went_well') {
       db.prepare('UPDATE friday_sessions SET went_well = ? WHERE id = ?').run(userMessage, sessionId);
-    } else if (step === 'was_difficult') {
+    } else if (currentStep === 'was_difficult') {
       db.prepare('UPDATE friday_sessions SET was_difficult = ? WHERE id = ?').run(userMessage, sessionId);
-    } else if (step === 'gratitude') {
+    } else if (currentStep === 'gratitude') {
       db.prepare('UPDATE friday_sessions SET grateful_for = ? WHERE id = ?').run(userMessage, sessionId);
     }
   }
@@ -251,24 +436,24 @@ Reageer passend op het bericht van de gebruiker en leid het gesprek verder.`;
 
   // Determine next step
   const isComplete = currentStep === 'closing';
-  let nextStep = currentStep;
   if (!isComplete) {
-    const idx = FRIDAY_STEPS.indexOf(currentStep);
-    nextStep = idx >= 0 && idx < FRIDAY_STEPS.length - 1
-      ? FRIDAY_STEPS[idx + 1]
-      : 'closing';
+    if (stayOnStep) {
+      nextStep = currentStep;
+    } else {
+      const idx = FRIDAY_STEPS.indexOf(currentStep);
+      nextStep = idx >= 0 && idx < FRIDAY_STEPS.length - 1
+        ? FRIDAY_STEPS[idx + 1]
+        : 'closing';
+    }
   }
 
-  return { responseText, nextStep, isComplete };
+  return { responseText, nextStep, isComplete, sideEffects };
 }
 
 // ---------------------------------------------------------------------------
 // Week report
 // ---------------------------------------------------------------------------
 
-/**
- * Build the formatted habit week report string.
- */
 async function generateWeekReport(weekNumber, year) {
   const db     = getDb();
   const habits = db.prepare('SELECT * FROM habits WHERE active = 1').all();
@@ -329,6 +514,22 @@ async function generateWeekReport(weekNumber, year) {
     report += `Weekscore: ${totalCompleted}/${totalExpected} — ${score}% ${scoreEmoji}\n\n`;
   }
 
+  // Append open todos from previous weeks if any
+  const openTodos = db.prepare(`
+    SELECT description FROM todos
+    WHERE completed = 0
+      AND (year < ? OR (year = ? AND week_number < ?))
+    ORDER BY year ASC, week_number ASC, id ASC
+  `).all(year, year, weekNumber);
+
+  if (openTodos.length > 0) {
+    report += `📌 Openstaande to-do's van vorige week(en):\n`;
+    openTodos.forEach((t, i) => {
+      report += `${i + 1}. ${t.description}\n`;
+    });
+    report += '\n';
+  }
+
   return report;
 }
 
@@ -341,21 +542,22 @@ async function generateSessionSummary(sessionId) {
   const session = db.prepare('SELECT * FROM friday_sessions WHERE id = ?').get(sessionId);
   if (!session) return 'Geen sessie gevonden.';
 
-  const todos = db.prepare(`
-    SELECT description FROM todos WHERE week_number = ? AND year = ? AND completed = 0
+  const newTodos = db.prepare(`
+    SELECT description FROM todos WHERE week_number = ? AND year = ?
   `).all(session.week_number, session.year);
 
   const prompt = `Genereer een bondige, warme samenvatting van de vrijdagsessie op basis van:
 - Wat ging goed: ${session.went_well || '(niet ingevuld)'}
 - Wat was moeilijk: ${session.was_difficult || '(niet ingevuld)'}
 - Dankbaar voor: ${session.grateful_for || '(niet ingevuld)'}
-- Nieuwe to-do's komende week: ${todos.length > 0 ? todos.map(t => t.description).join(', ') : 'geen'}
+- To-do's voor komende week: ${newTodos.length > 0 ? newTodos.map(t => `"${t.description}"`).join(', ') : 'geen vastgelegd'}
 
+Som de to-do's expliciet op zodat de gebruiker ze ziet.
 Sluit af met een motiverende zin voor de komende week.`;
 
   const response = await client.messages.create({
     model:      MODEL,
-    max_tokens: 350,
+    max_tokens: 400,
     system:     buildSystemPrompt(),
     messages:   [{ role: 'user', content: prompt }]
   });

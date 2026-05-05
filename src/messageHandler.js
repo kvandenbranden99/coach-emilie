@@ -182,6 +182,14 @@ async function _handleFridayMessage(text, state) {
   const db = getDb();
 
   const result = await processFridaySession(text, state);
+
+  // Log any side effects from the session step (e.g. todos persisted)
+  if (Array.isArray(result.sideEffects)) {
+    for (const note of result.sideEffects) {
+      logger.info(`Vrijdagsessie ${state.sessionId}: ${note}`);
+    }
+  }
+
   // Friday session always goes via Telegram
   await _sendMessage(result.responseText, 'telegram');
 
