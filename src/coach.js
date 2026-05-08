@@ -103,18 +103,10 @@ Antwoord enkel met één woord: "completed", "declined", of "unknown".`,
 
 /**
  * Classify a user message against MULTIPLE pending habits in a single call.
- * Returns an object keyed by habit name, with values 'completed' | 'declined'
- * | 'not_mentioned'. Habits that aren't specifically referenced should be
- * marked 'not_mentioned' so we don't accidentally close them out.
- *
- * @param {string} userMessage
- * @param {Array<{id: number|string, name: string, period?: string}>} habits
- * @returns {Promise<Object<string, 'completed'|'declined'|'not_mentioned'>>}
  */
 async function detectMultiHabitResponses(userMessage, habits) {
   if (!userMessage || !habits || habits.length === 0) return {};
 
-  // Build a numbered list for the prompt
   const habitList = habits
     .map((h, i) => {
       const periodHint = h.period ? ` (${periodLabels[h.period] || h.period})` : '';
@@ -122,7 +114,6 @@ async function detectMultiHabitResponses(userMessage, habits) {
     })
     .join('\n');
 
-  // Default everyone to not_mentioned
   const result = {};
   habits.forEach(h => { result[h.name] = 'not_mentioned'; });
 
@@ -163,7 +154,6 @@ Bericht van de gebruiker:
     const clean = text.replace(/^```json\s*|\s*```$/g, '').trim();
     const parsed = JSON.parse(clean);
 
-    // Map back to habit names
     habits.forEach((h, i) => {
       const value = parsed[String(i + 1)];
       if (value === 'completed' || value === 'declined' || value === 'not_mentioned') {
@@ -172,7 +162,6 @@ Bericht van de gebruiker:
     });
   } catch (err) {
     logger.error('Fout bij detectMultiHabitResponses:', err.message);
-    // On error, leave everything as 'not_mentioned' (safer than misclassifying)
   }
 
   return result;
@@ -253,34 +242,53 @@ const FRIDAY_STEPS = [
 
 const MULTI_TURN_STEPS = new Set(['todo_review', 'new_todos']);
 
+/**
+ * Detect whether the user signals they are done with the current multi-turn step.
+ * Strategy: only match VERY specific multi-word phrases. Single words like
+ * "klaar", "door", "verder", "volgende" are too generic — they appear in normal
+ * Dutch sentences (e.g. "ik wil DOOR mijn lijst gaan", "VOLGENDE week", "KLAAR
+ * met de tafel"). Any single-word interpretation we delegate to the AI.
+ */
 async function _detectStepDone(userMessage, stepContext) {
   if (!userMessage) return false;
 
+  // Specific multi-word phrases that unambiguously mean "I'm done with this step"
   const doneKeywords = [
-    'klaar', 'genoeg', 'volgende', 'verder', 'door', 'next',
-    'dat is alles', 'dat was het', 'meer niet', 'ga door', 'ga maar door',
-    'volgende vraag', 'oké volgende', 'ok volgende'
+    'dat is alles', 'dat was het', 'meer niet', 'geen meer',
+    'ga door', 'ga maar door', 'we kunnen door', 'we kunnen verder',
+    'volgende vraag', 'volgende stap',
+    'oké volgende', 'ok volgende',
+    'ik ben klaar', 'ben klaar',
+    'verder niets', 'niks meer', 'niets meer'
   ];
   if (_matchesAnyWord(userMessage, doneKeywords)) return true;
 
+  // AI fallback for everything else. The prompt is now strict — the default
+  // is "nee" unless the user UNAMBIGUOUSLY signals they're done.
   try {
     const response = await client.messages.create({
       model:      MODEL,
       max_tokens: 5,
-      system:     `Beoordeel of de gebruiker aangeeft klaar te zijn met de huidige stap van een coaching gesprek.
+      system:     `Beoordeel of de gebruiker UITDRUKKELIJK aangeeft klaar te zijn met de huidige stap van een coaching gesprek.
+
 Context van de stap: ${stepContext}
 
-Voorbeelden die "ja" zijn (gebruiker wil door):
+KIES "ja" ALLEEN als de gebruiker DUIDELIJK signaleert dat hij/zij geen
+nieuwe inhoud meer wil delen voor deze stap. Bij twijfel of als het bericht
+nog inhoud bevat die bij deze stap hoort: kies "nee".
+
+Voorbeelden die "ja" zijn:
 - "dat zijn alle to-do's"
 - "verder niets"
 - "we kunnen door"
-- "dat was alles voor vorige week"
 - "geen meer"
+- "ik ben klaar"
 
-Voorbeelden die "nee" zijn (gebruiker is nog inhoud aan het delen):
-- gebruiker noemt nog een nieuwe taak/to-do
-- gebruiker bespreekt details
-- gebruiker stelt een vraag
+Voorbeelden die "nee" zijn:
+- gebruiker noemt nog een nieuwe taak/to-do (zelfs als hij "door" of "verder" gebruikt in de zin, bv. "ik wil DOOR mijn lijst gaan")
+- gebruiker bespreekt details of timing van een to-do (bv. "ik wil dat zondag doen")
+- gebruiker stelt een wedervraag
+- gebruiker beschrijft iets dat hij/zij wil gaan doen
 
 Antwoord enkel met "ja" of "nee".`,
       messages:   [{ role: 'user', content: userMessage }]
@@ -403,6 +411,7 @@ async function processFridaySession(userMessage, sessionState) {
   if (!wantsToClose && MULTI_TURN_STEPS.has(currentStep)) {
     const done = await _detectStepDone(userMessage, STEP_PROMPTS[currentStep]);
     stayOnStep = !done;
+    logger.info(`Vrijdagsessie ${sessionId} stap "${currentStep}": _detectStepDone=${done} → ${stayOnStep ? 'blijven' : 'doorgaan'}`);
   }
 
   if (currentStep === 'new_todos' && !stayOnStep) {
