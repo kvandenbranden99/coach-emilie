@@ -202,17 +202,26 @@ async function startFridaySession() {
   const now = DateTime.now().setZone(TIMEZONE);
   const db  = getDb();
 
-  // Prevent duplicate sessions for the same week
+  // Look for ANY existing session this week
   const existing = db.prepare(`
-    SELECT id FROM friday_sessions
+    SELECT * FROM friday_sessions
     WHERE week_number = ? AND year = ?
+    ORDER BY id DESC LIMIT 1
   `).get(now.weekNumber, now.year);
 
   if (existing) {
-    logger.warn(`Vrijdagsessie week ${now.weekNumber}/${now.year} bestaat al, overgeslagen`);
-    return;
+    // Already CLOSED this week? Then we're done — don't run a second time.
+    if (existing.ended_at) {
+      logger.warn(`Vrijdagsessie week ${now.weekNumber}/${now.year} is al afgesloten, overgeslagen`);
+      return;
+    }
+
+    // Session exists but never finished → resume it where we left off
+    logger.info(`Vrijdagsessie week ${now.weekNumber}/${now.year} bestaat (open) — wordt hervat door cron`);
+    return await _resumeFridaySession(existing, 'telegram');
   }
 
+  // No session yet for this week → start a fresh one
   logger.info('Vrijdagsessie starten…');
 
   const { lastInsertRowid: sessionId } = db.prepare(`
@@ -322,7 +331,7 @@ async function triggerFridaySessionFromUser(channel = 'telegram') {
 }
 
 async function _resumeFridaySession(session, channel) {
-  logger.info(`Vrijdagsessie ${session.id} hervat op vraag van gebruiker (vanuit ${channel})`);
+  logger.info(`Vrijdagsessie ${session.id} hervat (vanuit ${channel})`);
 
   const nextStep = _inferNextStepForOpenSession(session);
   const history  = _loadSessionHistory(session.id);
